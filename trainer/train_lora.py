@@ -28,12 +28,23 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
         X = X.to(args.device)
         Y = Y.to(args.device)
         loss_mask = loss_mask.to(args.device)
+
+        if step == start_step + 1:
+            print("\n[DEBUG][train_epoch] step", step)
+            print("  X:", X.shape)
+            print("  Y:", Y.shape)
+            print("  loss_mask:", loss_mask.shape, " 有效 token 数:", loss_mask.sum().item())
+
         lr = get_lr(epoch * iters + step, args.epochs * iters, args.learning_rate)
         for param_group in optimizer.param_groups:
             param_group['lr'] = lr
 
         with autocast_ctx:
             res = model(X)
+            if step == start_step + 1:
+                print("  logits:", res.logits.shape)
+                if hasattr(res, "aux_loss"):
+                    print("  aux_loss (MoE等):", res.aux_loss.item())
             loss = loss_fct(
                 res.logits.view(-1, res.logits.size(-1)),
                 Y.view(-1)
@@ -43,7 +54,18 @@ def train_epoch(epoch, loader, iters, lora_params, start_step=0, wandb=None):
             loss += res.aux_loss
             loss = loss / args.accumulation_steps
 
+        if step == start_step + 1:
+            print("  CE+aux 合并后的 loss:", loss.item() * args.accumulation_steps)
+
         scaler.scale(loss).backward()
+
+        if step == start_step + 1:
+            for name, p in model.named_parameters():
+                if 'lora' in name and p.grad is not None:
+                    print("  [DEBUG] 示例 LoRA 参数:", name)
+                    print("    grad 形状:", p.grad.shape)
+                    print("    grad 均值:", p.grad.mean().item(), "max:", p.grad.max().item())
+                    break
 
         if (step + 1) % args.accumulation_steps == 0:
             scaler.unscale_(optimizer)
@@ -135,6 +157,12 @@ if __name__ == "__main__":
     Logger(f"LLM 总参数量: {total_params / 1e6:.3f} M")
     Logger(f"LoRA 参数量: {lora_params_count / 1e6:.3f} M")
     Logger(f"LoRA 参数占比: {lora_params_count / total_params * 100:.2f}%")
+
+    print("\n[DEBUG] 部分 LoRA 参数名字：")
+    for name, p in model.named_parameters():
+        if 'lora' in name:
+            print("  ", name, p.shape)
+            break
     
     # 冻结非LoRA参数，收集LoRA参数
     lora_params = []
@@ -144,6 +172,10 @@ if __name__ == "__main__":
             lora_params.append(param)
         else:
             param.requires_grad = False
+
+    print("\n[DEBUG] 需要更新的参数个数（应该只包含 LoRA）：", len(lora_params))
+    print("[DEBUG] requires_grad=True 的参数数量：",
+          sum(1 for _, p in model.named_parameters() if p.requires_grad))
     
     # ========== 6. 定义数据和优化器 ==========
     train_ds = SFTDataset(args.data_path, tokenizer, max_length=args.max_seq_len)
@@ -175,4 +207,11 @@ if __name__ == "__main__":
             train_epoch(epoch, loader, len(loader) + start_step + 1, lora_params, start_step, wandb)
         else: # 默认从头开始
             loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=(train_sampler is None), sampler=train_sampler, num_workers=args.num_workers, pin_memory=True)
+            if not dist.is_initialized():
+                first_batch = next(iter(loader))
+                X_dbg, Y_dbg, loss_mask_dbg = first_batch
+                print("\n[DEBUG] 首个 batch 形状：")
+                print("  X:", X_dbg.shape)
+                print("  Y:", Y_dbg.shape)
+                print("  loss_mask:", loss_mask_dbg.shape, " 有效 token 数:", loss_mask_dbg.sum().item())
             train_epoch(epoch, loader, len(loader), lora_params, 0, wandb)

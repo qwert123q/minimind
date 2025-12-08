@@ -2,3 +2,5 @@ model/__pycache__
 out
 website/
 docs-minimind/
+.DS_Store
+ML/myTransformer/__pycache__
