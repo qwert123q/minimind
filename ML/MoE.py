@@ -83,57 +83,44 @@ class MoELayer(nn.Module):
     
 
 """
-假设：
+假设配置：batch_size=1, seq_len=2, d_model=4
+x = torch.tensor([[
+    [0.1, 0.2, 0.3, 0.4],  # token0
+    [0.5, 0.6, 0.7, 0.8]   # token1
+]], dtype=torch.float32)
 
-batch_size = 1
-seq_len = 2（一句话里有两个 token）
-d_model = 4（每个 token 向量4维）
-num_experts = 3（3个专家）
-top_k = 2（每个 token 只选2个专家）
 
-1.输入 x 形状：(1, 2, 4)，可以写成：
 
-token0: [1.0, 0.5, -0.2, 0.3]
-token1: [-0.1, 0.7, 0.4, 0.0]
+1. 输入重塑：[[0.1,0.2,0.3,0.4], [0.5,0.6,0.7,0.8]]
 
-2.展平后变成 (2, 4)，两行分别是上述两个 token。
+2. 门控网络输出示例：
+router_logits = [[0.5, 1.2, 0.8, 0.3], [0.9, 0.4, 1.5, 0.7]]
+routing_weights = [[0.15, 0.45, 0.30, 0.10], [0.20, 0.10, 0.50, 0.20]]  # 已归一化
 
-3.每个 token 通过 gating_network 得到 3 个 logit，例如：
+3. Top-k=2选择：
+top_k_weights = [[0.45, 0.30], [0.50, 0.20]]
+top_k_indexes = [[1, 2], [2, 3]]  # token0选专家1、2；token1选专家2、3
 
-对 token0：router_logits[0] = [2.0, 1.0, -1.0]
-对 token1：router_logits[1] = [0.5, 1.5, 0.0]
+4. 重新归一化：
+top_k_weights_norm = torch.tensor([
+    [0.6, 0.4],  # token 0 对专家1的权重0.6，专家2的权重0.4
+    [0.7, 0.3]   # token 1 对专家2的权重0.7，专家3的权重0.3
+])
 
-4.softmax 后得到 routing_weights，例如：
+token_input = x_reshaped[0]  # [0.1, 0.2, 0.3, 0.4]
 
-token0 对专家的权重（近似）：
-expert0: 0.71
-expert1: 0.26
-expert2: 0.03
-token1 对专家的权重（近似）：
-expert0: 0.24
-expert1: 0.65
-expert2: 0.11
+5. 对于token0：
+# 处理第1个选中专家（k=0）：
+expert_idx = top_k_indexes[0, 0].item()  # 1
+expert_weight = top_k_weights_norm[0, 0]  # 0.6
+expert_output = self.experts[1](token_input)  # 假设输出 [0.2, 0.3, 0.4, 0.5]
+final_output[0] += 0.6 * [0.2, 0.3, 0.4, 0.5]  # final_output[0] = [0.12, 0.18, 0.24, 0.30]
 
-5.top_k = 2，所以只取最大两个专家：
+# 处理第2个选中专家（k=1）：
+expert_idx = top_k_indexes[0, 1].item()  # 2
+expert_weight = top_k_weights_norm[0, 1]  # 0.4
+expert_output = self.experts[2](token_input)  # 假设输出 [0.3, 0.4, 0.5, 0.6]
+final_output[0] += 0.4 * [0.3, 0.4, 0.5, 0.6]  # final_output[0] = [0.12+0.12, 0.18+0.16, 0.24+0.20, 0.30+0.24] = [0.24, 0.34, 0.44, 0.54]
 
-token0:
-indices: [0, 1]（专家0和1）
-weights: [0.71, 0.26]
-token1:
-indices: [1, 0]（专家1和0）
-weights: [0.65, 0.24]
-再归一化，让2个权重和为1（这里已经差不多接近1，就略过）。
-
-6.对 token0：
-
-用专家0处理：y0 = Expert0(token0) 得到一个 4 维向量
-用专家1处理：y1 = Expert1(token0) 得到一个 4 维向量
-最终输出：out_token0 = 0.71 * y0 + 0.26 * y1（忽略了专家2）
-对 token1 类似：
-
-y1' = Expert1(token1)
-y0' = Expert0(token1)
-out_token1 = 0.65 * y1' + 0.24 * y0'
-
-7.把 out_token0 和 out_token1 堆成 (1, 2, 4) 返回。
+6. 最终输出
 """
